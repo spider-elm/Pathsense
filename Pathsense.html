@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PathSense | Obstacle Alert Prototype</title>
+<style>
+:root{--blue:#0064e0;--panel:#2e2e34;--sub:#b0b0b0;--safe:#00c853;--warn:#ffab00;--danger:#d50000}
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+header{padding:14px 20px;border-bottom:1px solid #333;display:flex;justify-content:space-between;align-items:center}
+.brand{font-weight:700;font-size:1.2rem}.brand span{color:var(--blue)}
+.status{display:flex;align-items:center;gap:8px;font-size:.85rem;color:var(--sub)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--danger)}
+.dot.on{background:var(--safe)}.dot.load{background:var(--warn)}
+main{flex:1;display:grid;grid-template-columns:2fr 1fr;gap:20px;padding:20px}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.stage{position:relative;width:100%;aspect-ratio:4/3;background:#111;border:1px solid #333;border-radius:12px;overflow:hidden}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%}
+#banner{position:absolute;left:14px;right:14px;bottom:14px;padding:12px 16px;border-radius:10px;background:rgba(0,0,0,.72);border:1px solid var(--blue);font-size:1.15rem;font-weight:600}
+#banner.warn{border-color:var(--warn)}
+#banner.danger{border-color:var(--danger);background:rgba(213,0,0,.78)}
+.panel{background:var(--panel);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:16px}
+.panel h2{font-size:1.05rem;margin:0;padding-bottom:8px;border-bottom:1px solid #444}
+button{font:inherit;border:0;border-radius:8px;padding:12px;cursor:pointer;color:#fff;background:var(--blue);font-weight:600}
+button.alt{background:#1a1a1a;border:1px solid #444}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--warn);outline-offset:2px}
+.row{display:flex;justify-content:space-between;align-items:center;font-size:.92rem;gap:10px}
+select{background:#1a1a1a;color:#fff;border:1px solid #444;border-radius:6px;padding:6px}
+input[type=checkbox]{width:20px;height:20px;accent-color:var(--blue)}
+#log{flex:1;min-height:140px;max-height:260px;overflow-y:auto;background:#000;border:1px solid #333;border-radius:8px;padding:10px;font:.8rem "Courier New",monospace}
+.e{margin-bottom:6px;border-bottom:1px solid #111;padding-bottom:4px}
+.t{color:var(--sub);margin-right:6px}.info{color:var(--blue)}.warn{color:var(--warn)}.danger{color:#ff5252}
+.note{background:rgba(0,100,224,.1);border:1px solid var(--blue);padding:10px;border-radius:8px;font-size:.82rem;line-height:1.4}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Path<span>Sense</span></div>
+  <div class="status"><div class="dot" id="dot"></div><span id="statusText">Camera off</span></div>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="banner" role="status">Press Start to begin.</div>
+  </div>
+  <div class="panel">
+    <h2>Controls</h2>
+    <button id="start">Start</button>
+    <button id="describe" class="alt" disabled>What is ahead?</button>
+    <div class="row"><label for="voice">Voice guidance</label><input type="checkbox" id="voice" checked></div>
+    <div class="row"><label for="sens">Warn me within</label>
+      <select id="sens"><option value="2">2 m</option><option value="3" selected>3 m</option><option value="4">4 m</option></select></div>
+    <h2>Alert log</h2>
+    <div id="log"></div>
+    <div class="note"><strong>Prototype note:</strong> this version uses this computer's webcam as a stand-in for the glasses. It recognises 80 common object types only, and distances are estimates from box size. It is not safe to rely on for real navigation.</div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+let model = null, stream = null, running = false, lastFound = [], lastSpoken = 0, lastKey = '', streak = {};
+
+// Approximate real-world heights (metres), used to estimate distance from box size.
+const HEIGHTS = {person:1.7,bicycle:1.0,car:1.5,motorcycle:1.1,bus:3,truck:3,bench:0.9,chair:0.9,couch:0.9,
+  'potted plant':0.6,'dining table':0.75,dog:0.5,cat:0.3,'fire hydrant':0.6,'stop sign':0.75,
+  'traffic light':0.9,suitcase:0.6,backpack:0.45,umbrella:0.9,bed:0.6,tv:0.5,'parking meter':1.2};
+const STEP = 0.7;        // metres per walking step
+const VFOV = 0.93;       // 2*tan(25deg): assumes about a 50 degree vertical field of view
+
+function log(msg, type = 'info') {
+  const d = document.createElement('div');
+  d.className = 'e';
+  d.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}</span><span class="${type}">${msg}</span>`;
+  $('log').prepend(d);
+  while ($('log').children.length > 50) $('log').lastChild.remove();
+}
+function setStatus(text, state) { $('statusText').textContent = text; $('dot').className = 'dot ' + (state || ''); }
+function setBanner(text, level) { $('banner').textContent = text; $('banner').className = level || ''; }
+function say(text, interrupt) {
+  if (!('speechSynthesis' in window)) return;
+  if (interrupt) speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+
+function analyse(p, W, H) {
+  const [x, y, w, h] = p.bbox;
+  const dist = (HEIGHTS[p.class] || 0.6) / ((h / H) * VFOV);
+  const cx = (x + w / 2) / W;
+  const zone = cx < 0.35 ? 'on your left' : cx > 0.65 ? 'on your right' : 'ahead';
+  const inPath = x < 0.75 * W && x + w > 0.25 * W;
+  return { p, dist, zone, inPath };
+}
+
+function handle(found) {
+  const limit = +$('sens').value;
+  const threats = found.filter(f => f.inPath && f.dist < limit).sort((a, b) => a.dist - b.dist);
+  const seen = new Set(threats.map(f => f.p.class + f.zone));
+  for (const k of Object.keys(streak)) if (!seen.has(k)) delete streak[k];
+  seen.forEach(k => streak[k] = (streak[k] || 0) + 1);
+  const top = threats.find(f => streak[f.p.class + f.zone] >= 2);   // must appear in 2 frames in a row
+  if (!top) { setBanner('Watching the path...', ''); return; }
+
+  const steps = Math.max(1, Math.round(top.dist / STEP));
+  const urgent = top.dist < 1.2;
+  const text = urgent ? `Stop. ${top.p.class} ${top.zone}.` : `${top.p.class} ${top.zone}, about ${steps} steps.`;
+  setBanner(text, urgent ? 'danger' : 'warn');
+
+  const key = top.p.class + top.zone, now = Date.now();
+  const repeat = key === lastKey && now - lastSpoken < (urgent ? 1500 : 4000);
+  if (repeat) return;
+  if (!urgent && 'speechSynthesis' in window && speechSynthesis.speaking) return;
+  lastKey = key; lastSpoken = now;
+  log(text, urgent ? 'danger' : 'warn');
+  if ($('voice').checked) say(text, urgent);
+}
+
+async function loop() {
+  if (!running) return;
+  const W = video.videoWidth, H = video.videoHeight;
+  if (W && canvas.width !== W) { canvas.width = W; canvas.height = H; }
+  if (W) {
+    const preds = await model.detect(video, 10, 0.55);
+    if (!running) return;
+    ctx.clearRect(0, 0, W, H);
+    const limit = +$('sens').value;
+    lastFound = preds.map(p => analyse(p, W, H));
+    for (const f of lastFound) {
+      const [x, y, w, h] = f.p.bbox;
+      const color = f.inPath && f.dist < limit ? '#d50000' : f.dist < limit ? '#ffab00' : '#00c853';
+      ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = color; ctx.font = 'bold 20px Arial';
+      ctx.fillText(`${f.p.class} ~${f.dist.toFixed(1)} m`, x + 4, Math.max(22, y - 8));
+    }
+    handle(lastFound);
+  }
+  requestAnimationFrame(loop);
+}
+
+function stop() {
+  running = false;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  speechSynthesis.cancel();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $('start').textContent = 'Start'; $('describe').disabled = true;
+  setStatus('Camera off', ''); setBanner('Press Start to begin.', '');
+}
+
+$('start').onclick = async () => {
+  if (running) { stop(); return; }
+  $('start').disabled = true;
+  try {
+    setStatus('Loading AI model...', 'load');
+    if (!model) model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    $('stage').style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    running = true;
+    setStatus('Camera on (stand-in for glasses)', 'on');
+    log('Camera and model ready.', 'info');
+    if ($('voice').checked) say('PathSense is ready.');
+    $('start').textContent = 'Stop'; $('describe').disabled = false;
+    loop();
+  } catch (err) {
+    setStatus('Error', ''); setBanner('Could not start. See the log.', 'danger');
+    log('Error: ' + err.message, 'danger');
+  }
+  $('start').disabled = false;
+};
+
+$('describe').onclick = () => {
+  if (!lastFound.length) { say('I do not see any objects I recognise.', true); return; }
+  const parts = lastFound.map(f => `${f.p.class} ${f.zone}, about ${Math.max(1, Math.round(f.dist / STEP))} steps`);
+  const text = 'I can see: ' + parts.join('. ');
+  log(text, 'info'); say(text, true);
+};
+</script>
+</body>
+</html>
